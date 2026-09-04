@@ -496,6 +496,10 @@ export async function getDisputeByTradeId(tradeId: string): Promise<DisputeRecor
   );
 }
 
+/**
+ * #371: Canonical pause — updates both `availability` and `merchant_available`
+ * atomically so discovery cannot show a paused provider.
+ */
 export async function pauseUser(
   userId: string,
   reason: string,
@@ -505,6 +509,7 @@ export async function pauseUser(
     `UPDATE users
      SET is_suspended = true,
          availability = 'paused',
+         merchant_available = false,
          suspended_at = NOW(),
          suspension_reason = $2
      WHERE id = $1`,
@@ -520,6 +525,10 @@ export async function pauseUser(
   });
 }
 
+/**
+ * #371: Canonical unpause — updates both `availability` and `merchant_available`
+ * atomically so discovery reflects the user's actual state.
+ */
 export async function unpauseUser(
   userId: string,
   adminId: string | null,
@@ -528,6 +537,7 @@ export async function unpauseUser(
     `UPDATE users
      SET is_suspended = false,
          availability = 'online',
+         merchant_available = CASE WHEN provider_status = 'active' THEN true ELSE merchant_available END,
          suspended_at = NULL,
          suspension_reason = NULL
      WHERE id = $1`,

@@ -16,7 +16,12 @@ CREATE TABLE users (
   stellar_address          VARCHAR(56) UNIQUE,
   username                 VARCHAR(30) UNIQUE,
   phone_hash               VARCHAR(64) UNIQUE,
-  merchant_available       BOOLEAN NOT NULL DEFAULT true,
+  -- #371: merchant_available defaults to false; only active providers should
+  -- be discoverable. Kept as a compatibility boolean alongside availability.
+  merchant_available       BOOLEAN NOT NULL DEFAULT false,
+  -- #371: explicit provider enrollment status. New users are not enrolled.
+  provider_status          VARCHAR(20) NOT NULL DEFAULT 'not_enrolled'
+                           CHECK (provider_status IN ('not_enrolled', 'pending_verification', 'active', 'suspended')),
   deleted_at               TIMESTAMPTZ,
   deleted_username         VARCHAR(30),
   deleted_stellar_address  VARCHAR(56),
@@ -25,6 +30,9 @@ CREATE TABLE users (
 );
 
 CREATE INDEX idx_users_stellar ON users (stellar_address);
+
+-- #371: idx_users_provider_active is created by migration
+-- 20260828000000_provider_enrollment.up.sql AFTER availability exists.
 
 -- ================================================
 -- WALLETS

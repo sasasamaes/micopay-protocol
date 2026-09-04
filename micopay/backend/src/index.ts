@@ -18,6 +18,7 @@ import { kycRoutes } from './routes/kyc.js';
 import { rampRoutes } from './routes/ramp.js';
 import { signRequestsRoutes } from './routes/sign-requests.js';
 import { clientErrorRoutes } from './routes/client-errors.js';
+import { providerRoutes } from './routes/providers.js';
 import { AppError } from './utils/errors.js';
 import { Keypair } from '@stellar/stellar-sdk';
 import fastifyStatic from '@fastify/static';
@@ -250,6 +251,7 @@ app.register(rateRoutes, { prefix: '' });
 app.register(kycRoutes, { prefix: '' });
 app.register(rampRoutes, { prefix: '' });
 app.register(signRequestsRoutes, { prefix: '' });
+app.register(providerRoutes, { prefix: '' });
 // El ErrorBoundary del frontend postea aquí; la ruta existía sin registrar, así
 // que hasta ahora todo reporte de crash caía en un 404
 // (docs/AUDIT_MOBILE_MAINNET.md §6, "Ruta backend definida pero no registrada").
@@ -265,8 +267,15 @@ async function seedData() {
   app.log.info({ category: 'seed' }, '🌱 Seeding demo trades...');
   const users = await db.getMany('SELECT id FROM users');
   if (users.length < 2) {
-    await db.execute("INSERT INTO users (username, stellar_address) VALUES ('juan_test', 'GBUYER...')");
-    await db.execute("INSERT INTO users (username, stellar_address) VALUES ('farmacia_test', 'GSELLER...')");
+    // #371: demo seed users are explicitly set as active providers.
+    await db.execute(
+      `INSERT INTO users (username, stellar_address, merchant_available, availability, provider_status)
+       VALUES ('juan_test', 'GBUYER...', true, 'online', 'active')`,
+    );
+    await db.execute(
+      `INSERT INTO users (username, stellar_address, merchant_available, availability, provider_status)
+       VALUES ('farmacia_test', 'GSELLER...', true, 'online', 'active')`,
+    );
   }
   const allUsers = await db.getMany('SELECT id FROM users');
   const userId = allUsers[0].id;
@@ -349,15 +358,18 @@ async function seedDemoMerchants(): Promise<void> {
   let buyer = await db.getOne("SELECT id FROM users WHERE username = 'cliente_demo'");
   if (!buyer) {
     buyer = await db.getOne(
-      `INSERT INTO users (username, stellar_address, merchant_available) VALUES ('cliente_demo', $1, false) RETURNING id`,
+      `INSERT INTO users (username, stellar_address, merchant_available, availability, provider_status)
+       VALUES ('cliente_demo', $1, false, 'offline', 'not_enrolled') RETURNING id`,
       [buyerAddr],
     );
   }
 
   for (const m of merchants) {
     const stellar = ('G' + m.username.toUpperCase().replace(/[^A-Z0-9]/g, 'X')).padEnd(56, 'X').slice(0, 56);
+    // #371: demo seed data explicitly creates active providers.
     const user = await db.getOne(
-      `INSERT INTO users (username, stellar_address, merchant_available) VALUES ($1, $2, true) RETURNING id`,
+      `INSERT INTO users (username, stellar_address, merchant_available, availability, provider_status)
+       VALUES ($1, $2, true, 'online', 'active') RETURNING id`,
       [m.username, stellar],
     );
     await db.execute(`INSERT INTO wallets (user_id, stellar_address) VALUES ($1, $2)`, [user.id, stellar]).catch(() => {});

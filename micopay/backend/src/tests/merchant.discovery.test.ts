@@ -1,15 +1,16 @@
 /**
- * G1 — /merchants/available is public, unauthenticated and (before this fix)
+ * G1 + #371 — /merchants/available is public, unauthenticated and (before this fix)
  * had no rate limit and returned exact lat/lng, letting anyone scrape the
  * full census of merchant locations.
  *
- * This test covers the two mitigations from docs/PLAN_MAPA_REAL_2026-07.md
- * WP3:
+ * This test covers:
  *   (a) getAvailableMerchants() rounds the *returned* latitude/longitude to
  *       3 decimals (~110m) while distance_km keeps its existing precision.
  *   (b) the discoveryRateLimit limiter (createRateLimiter({ windowMs: 60_000,
  *       max: 30 })) throws a RateLimitError (429, Retry-After) once a single
  *       IP exceeds `max` requests inside the window.
+ *   (c) #371: discovery FAILS CLOSED — suspended, banned, paused, offline,
+ *       and not_enrolled providers are absent from discovery results.
  *
  * Runs against the in-memory DB (ALLOW_IN_MEMORY_DB=true, no PostgreSQL
  * needed), following the pattern of tradeAuth.test.ts / refund.test.ts.
@@ -102,7 +103,7 @@ async function testAvailableMerchantsRoundsCoordinates() {
     "distance_km must reflect the precise coordinates, unaffected by public lat/lng rounding",
   );
 
-  console.log("  ✓ getAvailableMerchants() rounds public latitude/longitude to 3 decimals, distance_km unaffected");
+  console.log("  \u2713 getAvailableMerchants() rounds public latitude/longitude to 3 decimals, distance_km unaffected");
 }
 
 // ── (b) discovery rate limiter ─────────────────────────────────────────────
@@ -130,7 +131,7 @@ async function testDiscoveryRateLimiterBlocksAfterMax() {
   for (let i = 0; i < max; i++) {
     await (discoveryRateLimit as any)(mockReq, mockReply);
   }
-  console.log(`  ✓ ${max} requests from the same IP within the window are allowed`);
+  console.log(`  \u2713 ${max} requests from the same IP within the window are allowed`);
 
   let threw = false;
   try {
@@ -142,22 +143,128 @@ async function testDiscoveryRateLimiterBlocksAfterMax() {
     ok((err as RateLimitError).retryAfter !== undefined, "rate-limited response must carry retryAfter");
   }
   ok(threw, `request ${max + 1} should have thrown RateLimitError`);
-  console.log("  ✓ request past max is rejected with 429 and Retry-After");
+  console.log("  \u2713 request past max is rejected with 429 and Retry-After");
 
   // A different IP is unaffected by the first IP's exhausted budget.
   const otherReq = { ip: "203.0.113.99" };
   await (discoveryRateLimit as any)(otherReq, mockReply);
-  console.log("  ✓ a different IP is not affected by another IP's rate limit");
+  console.log("  \u2713 a different IP is not affected by another IP's rate limit");
+}
+
+// ── (c) #371: discovery fail-closed eligibility ───────────────────────────
+//
+// The point of this issue is that discovery FAILS CLOSED. A suspended,
+// banned, paused or offline provider must be ABSENT from
+// GET /merchants/available — not merely rejected later at trade creation.
+//
+// The in-memory SQL shim cannot evaluate the WHERE clause, so these tests
+// capture the raw SQL text passed to db.getMany and assert that the four
+// eligibility predicates are present. This fails if someone removes a filter,
+// which is the whole point.
+
+const ELIGIBLE_MERCHANT_ROW = {
+  seller_id: "user-active-1",
+  username: "merchant_active_1",
+  rate_percent: "1.5",
+  min_trade_mxn: 100,
+  max_trade_mxn: 50000,
+  daily_cap_mxn: 250000,
+  latitude: "19.432",
+  longitude: "-99.133",
+  address_text: "CDMX",
+  distance_km: "0.5",
+  trades_completed: "3",
+  trades_terminal: "3",
+};
+
+const SEARCH_PARAMS = { lat: 19.432, lng: -99.133, radius_km: 5, amount_mxn: 500 };
+
+/**
+ * Helper: stubs db.getMany to return the given rows and captures the SQL
+ * text for assertion.
+ */
+async function discoveryCaptureSql(): Promise<{
+  sql: string;
+  results: Awaited<ReturnType<typeof getAvailableMerchants>>;
+}> {
+  let capturedSql = "";
+  const originalGetMany = db.getMany;
+  db.getMany = (async (text: string) => {
+    capturedSql = text;
+    return [ELIGIBLE_MERCHANT_ROW];
+  }) as typeof db.getMany;
+  try {
+    const results = await getAvailableMerchants(SEARCH_PARAMS);
+    return { sql: capturedSql, results };
+  } finally {
+    db.getMany = originalGetMany;
+  }
+}
+
+/**
+ * Asserts that the WHERE clause contains all four eligibility predicates
+ * that RED-1 requires for fail-closed discovery.
+ */
+function assertDiscoverySqlHasEligibilityPredicates(sql: string) {
+  const lower = sql.toLowerCase();
+
+  // 1. provider_status = 'active'
+  ok(
+    lower.includes("provider_status") && lower.includes("active"),
+    "SQL must filter on provider_status = 'active'",
+  );
+
+  // 2. availability = 'online'
+  ok(
+    lower.includes("availability") && lower.includes("online"),
+    "SQL must filter on availability = 'online'",
+  );
+
+  // 3. NOT suspended
+  ok(
+    lower.includes("is_suspended"),
+    "SQL must filter out suspended users (is_suspended)",
+  );
+
+  // 4. NOT banned
+  ok(
+    lower.includes("is_banned"),
+    "SQL must filter out banned users (is_banned)",
+  );
+
+  // 5. merchant_available check (IS NULL or = false excludes unavailable)
+  ok(
+    lower.includes("merchant_available"),
+    "SQL must filter on merchant_available",
+  );
+
+  console.log("  \u2713 discovery SQL contains all fail-closed eligibility predicates");
+}
+
+async function testDiscoverySqlContainsEligibilityPredicates() {
+  const { sql } = await discoveryCaptureSql();
+  assertDiscoverySqlHasEligibilityPredicates(sql);
+}
+
+async function testDiscoveryIncludesActiveAvailableProvider() {
+  // An active, online, available provider with a location IS returned.
+  const { results } = await discoveryCaptureSql();
+  strictEqual(results.length, 1, "active+online provider must appear in discovery");
+  strictEqual(results[0].seller_id, "user-active-1");
+  console.log("  \u2713 active+online provider appears in discovery");
 }
 
 async function main() {
-  console.log("\nMerchant discovery privacy & rate-limit tests\n");
+  console.log("\nMerchant discovery privacy, rate-limit & #371 eligibility tests\n");
   await testAvailableMerchantsRoundsCoordinates();
   await testDiscoveryRateLimiterBlocksAfterMax();
+  console.log("\n  #371 fail-closed discovery eligibility:\n");
+  await testDiscoverySqlContainsEligibilityPredicates();
+  await testDiscoveryIncludesActiveAvailableProvider();
   console.log("\nAll merchant.discovery tests passed.\n");
 }
 
 main().catch((err) => {
-  console.error("❌ merchant.discovery tests failed:", err);
+  console.error("\u274c merchant.discovery tests failed:", err);
   process.exit(1);
 });

@@ -79,11 +79,13 @@ export async function userRoutes(app: FastifyInstance) {
         );
       }
 
+      // #371: new users start as not_enrolled and unavailable — they must
+      // explicitly enroll to become discoverable as a Red MicoPay provider.
       const user = await db.getOne(
-        `INSERT INTO users (stellar_address, username, phone_hash, merchant_available)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, stellar_address, username, merchant_available, created_at`,
-        [stellar_address, username, phone_hash || null, true],
+        `INSERT INTO users (stellar_address, username, phone_hash, merchant_available, availability, provider_status)
+         VALUES ($1, $2, $3, false, 'offline', 'not_enrolled')
+         RETURNING id, stellar_address, username, merchant_available, availability, provider_status, created_at`,
+        [stellar_address, username, phone_hash || null],
       );
 
       // Create wallet record
@@ -246,8 +248,9 @@ export async function userRoutes(app: FastifyInstance) {
   /**
    * PATCH /users/me/availability
    * Sets whether the authenticated merchant is currently accepting new trades.
-   * `paused` is stored the same as `offline` (merchant_available=false) — the
-   * distinction is UI-only (temporary vs deliberate) for now.
+   * #371: only active providers may change availability. Both the canonical
+   * `availability` enum and the compatibility boolean `merchant_available` are
+   * updated atomically so discovery cannot show a paused provider.
    */
   app.patch(
     "/users/me/availability",
@@ -264,14 +267,31 @@ export async function userRoutes(app: FastifyInstance) {
         },
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const { availability } = request.body as { availability: "online" | "offline" | "paused" };
       const userId = request.user.id;
+
+      // #371: only active providers may update availability.
+      const user = await db.getOne<{ provider_status: string }>(
+        `SELECT provider_status FROM users WHERE id = $1`,
+        [userId],
+      );
+
+      if (!user || user.provider_status !== 'active') {
+        reply.status(403).send({
+          code: "PROVIDER_NOT_ACTIVE",
+          message: "Solo los proveedores activos pueden cambiar su disponibilidad.",
+        });
+        return;
+      }
+
       const merchant_available = availability === "online";
 
+      // #371: atomic write — both canonical availability and compatibility
+      // boolean must stay consistent so discovery never shows a paused provider.
       await db.execute(
-        `UPDATE users SET merchant_available = $1 WHERE id = $2`,
-        [merchant_available, userId],
+        `UPDATE users SET availability = $1, merchant_available = $2 WHERE id = $3`,
+        [availability, merchant_available, userId],
       );
 
       request.log.info(
@@ -279,7 +299,7 @@ export async function userRoutes(app: FastifyInstance) {
         "[merchant] Availability updated",
       );
 
-      return { merchant_available };
+      return { availability, merchant_available };
     },
   );
 }

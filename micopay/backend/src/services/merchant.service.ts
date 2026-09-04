@@ -96,9 +96,23 @@ function validateConfig(input: UpdateMerchantConfigInput) {
   }
 }
 
+/**
+ * #371: Separates config creation from enrollment. Only enrolled users
+ * (pending_verification or active) should have a merchant_config created.
+ * Reading merchant settings must not auto-create a config for non-enrolled
+ * users — that was the original bug that made any user discoverable.
+ */
 export async function getOrCreateMerchantConfig(userId: string): Promise<MerchantConfig> {
-  const user = await db.getOne('SELECT id FROM users WHERE id = $1', [userId]);
+  const user = await db.getOne<{ id: string; provider_status: string }>(
+    'SELECT id, provider_status FROM users WHERE id = $1',
+    [userId],
+  );
   if (!user) throw new NotFoundError('Merchant not found');
+
+  // #371: don't auto-create config for non-enrolled users.
+  if (user.provider_status === 'not_enrolled') {
+    throw new BadRequestError('Provider enrollment required before configuring merchant settings');
+  }
 
   const existing = await db.getOne<MerchantConfig>(
     `SELECT user_id, rate_percent, min_trade_mxn, max_trade_mxn, daily_cap_mxn,
@@ -150,7 +164,10 @@ export async function updateMerchantConfig(userId: string, input: UpdateMerchant
  * GET /merchants/available
  *
  * Returns merchants who:
- *  - have merchant_available = true
+ *  - are enrolled providers (provider_status = 'active')     — #371
+ *  - are currently available (availability = 'online')        — #371
+ *  - are not suspended or banned (is_suspended/banned != true) — #371
+ *  - have merchant_available = true (compatibility boolean)    — #371
  *  - have a location set (latitude/longitude NOT NULL)
  *  - are within radius_km of the caller's position
  *  - accept the requested amount_mxn (min_trade_mxn ≤ amount ≤ max_trade_mxn)
@@ -191,7 +208,11 @@ export async function getAvailableMerchants(
        COALESCE((SELECT COUNT(*) FROM trades t WHERE t.seller_id = u.id AND t.status IN ('completed','cancelled','refunded')), 0) AS trades_terminal
      FROM merchant_configs mc
      JOIN users u ON u.id = mc.user_id
-     WHERE u.merchant_available = true
+     WHERE u.provider_status = 'active'
+       AND u.availability = 'online'
+       AND u.merchant_available = true
+       AND (u.is_suspended IS NULL OR u.is_suspended = false)
+       AND (u.is_banned IS NULL OR u.is_banned = false)
        AND mc.latitude  IS NOT NULL
        AND mc.longitude IS NOT NULL
        AND mc.min_trade_mxn <= $3
